@@ -1,0 +1,1236 @@
+A multimodal Visual Question Answering (VQA) system for **Remote Sensing VQA**, based on the **RSVQA-LR** dataset. The model jointly processes a satellite image and a natural-language question and predicts answers through multiple task-specific heads.
+
+The implementation in this repository uses a **Vision Transformer (ViT)** image encoder, a **BERT** text encoder, a shared multimodal fusion network, and four prediction tasks:
+
+- **Presence** — binary classification
+- **Composition / comparison** — binary classification
+- **Rural / Urban** — binary classification
+- **Count** — numerical regression
+
+The notebook documents dataset preparation, model loading, checkpoint compatibility conversion, multitask training, count-focused fine-tuning, validation, and official test-set evaluation.
+
+---
+
+## 1. Project Overview
+
+Remote-sensing imagery contains large amounts of geographic information, but answering questions about that imagery requires both **visual understanding** and **language understanding**.
+
+For example, a question may ask whether a particular object is present, compare two object types, determine whether an area is rural or urban, or estimate the number of objects visible in an image.
+
+This project treats RSVQA as a **multitask multimodal learning problem**:
+
+```text
+                 Satellite Image
+                       │
+                       ▼
+             Vision Transformer (ViT)
+                       │
+                       │ Image Features
+                       │
+                       ├───────────────┐
+                       │               │
+                       │               │
+                       ▼               ▼
+                Text Question      BERT Encoder
+                                      │
+                                      │ Text Features
+                                      ▼
+                         ┌──────────────────────┐
+                         │ Multimodal Fusion    │
+                         │                      │
+                         │ Linear 1536 → 768   │
+                         │ ReLU + Dropout       │
+                         │ Linear 768 → 512    │
+                         │ ReLU + Dropout       │
+                         └──────────┬───────────┘
+                                    │
+                     Shared 512-D representation
+                                    │
+             ┌──────────────────────┼──────────────────────┐
+             │                      │                      │
+             ▼                      ▼                      ▼
+       Presence Head         Composition Head      Rural/Urban Head
+          2 classes             2 classes              2 classes
+             │                      │                      │
+             └──────────────────────┼──────────────────────┘
+                                    │
+                                    ▼
+                              Count Head
+                             512 → 256 → 1
+```
+
+The architecture allows the model to learn shared image-question representations while maintaining separate prediction heads for different answer types.
+
+---
+
+# 2. Dataset
+
+## RSVQA-LR
+
+The notebook uses the **RSVQA-LR** dataset and its low-resolution satellite imagery.
+
+The dataset package used by the notebook contains:
+
+```text
+SatQuery_RSVQA_Kaggle/
+├── project/
+│   ├── train.py
+│   ├── train_colab.py
+│   ├── model.py
+│   ├── data_pipeline.py
+│   ├── dataset.py
+│   ├── answer_vocab.json
+│   └── best_multitask_model_kaggle.pt
+│
+└── dataset/
+    ├── LR_split_train_questions.json
+    ├── LR_split_train_images.json
+    ├── LR_split_train_answers.json
+    ├── LR_split_val_questions.json
+    ├── LR_split_val_images.json
+    ├── LR_split_val_answers.json
+    ├── LR_split_test_questions.json
+    ├── LR_split_test_images.json
+    ├── LR_split_test_answers.json
+    ├── all_questions.json
+    ├── all_answers.json
+    ├── answer_vocab.json
+    └── Images_LR/
+        └── Images_LR/
+            ├── 0.tif
+            ├── 1.tif
+            ├── ...
+            └── 771.tif
+```
+
+### Image data
+
+The notebook verifies that the dataset contains **772 TIFF images**.
+
+The images are stored using numeric filenames:
+
+```text
+0.tif
+1.tif
+2.tif
+...
+771.tif
+```
+
+An important implementation detail is that the dataset wrapper uses the dataset's `image_id` to construct the actual image path:
+
+```python
+image_path = f"{image_dir}/{sample['image_id']}.tif"
+```
+
+The notebook explicitly notes that the JSON `original_name` is not used as the physical image filename.
+
+---
+
+# 3. Dataset Splits
+
+The final notebook run reports the following number of question samples:
+
+| Split | Samples |
+|---|---:|
+| Training | 57,223 |
+| Validation | 10,005 |
+| Official Test | 10,004 |
+
+The dataset loader reported zero skipped samples for these final splits.
+
+### Training
+
+```text
+Active questions : 57,223
+Final samples    : 57,223
+Skipped          : 0
+```
+
+### Validation
+
+```text
+Active questions : 10,005
+Final samples    : 10,005
+Skipped          : 0
+```
+
+### Test
+
+```text
+Active questions : 10,004
+Final samples    : 10,004
+Skipped          : 0
+```
+
+The notebook also reports that the test set contained 10,004 answers that were not found in the answer vocabulary used by the loader. Nevertheless, the final evaluation was performed using the task-specific labels and count values available in the dataset pipeline.
+
+---
+
+# 4. Question / Prediction Tasks
+
+The model is explicitly designed around four question types.
+
+## 4.1 Presence
+
+Binary classification answering whether an object or feature is present.
+
+Architecture:
+
+```text
+512-dimensional fused representation
+              ↓
+        Linear(512, 2)
+              ↓
+       Presence logits
+```
+
+Loss:
+
+```python
+CrossEntropyLoss
+```
+
+---
+
+## 4.2 Composition / Comparison
+
+Binary classification for comparison/composition questions.
+
+Architecture:
+
+```text
+512-dimensional fused representation
+              ↓
+        Linear(512, 2)
+              ↓
+        Comparison logits
+```
+
+Loss:
+
+```python
+CrossEntropyLoss
+```
+
+---
+
+## 4.3 Rural / Urban
+
+Binary classification determining the rural/urban category.
+
+Architecture:
+
+```text
+512-dimensional fused representation
+              ↓
+        Linear(512, 2)
+              ↓
+      Rural/Urban logits
+```
+
+Loss:
+
+```python
+CrossEntropyLoss
+```
+
+---
+
+## 4.4 Count
+
+The count task predicts a numerical quantity.
+
+Architecture:
+
+```text
+512
+ ↓
+Linear(512 → 256)
+ ↓
+ReLU
+ ↓
+Dropout(0.2)
+ ↓
+Linear(256 → 1)
+ ↓
+Predicted log(count)
+```
+
+The target count is transformed using:
+
+```python
+torch.log1p(count)
+```
+
+The model therefore learns to predict:
+
+```text
+log(1 + count)
+```
+
+During evaluation, the prediction is converted back using:
+
+```python
+torch.expm1(predicted_log_count)
+```
+
+Negative reconstructed values are clipped to zero.
+
+The count loss is:
+
+```python
+MSELoss
+```
+
+applied in log-count space.
+
+---
+
+# 5. Model Architecture
+
+## 5.1 Image Encoder — Vision Transformer
+
+The image encoder is:
+
+```text
+google/vit-base-patch16-224-in21k
+```
+
+implemented through:
+
+```python
+from transformers import ViTModel
+```
+
+The model receives the satellite image after preprocessing using:
+
+```python
+ViTImageProcessor.from_pretrained(
+    "google/vit-base-patch16-224-in21k"
+)
+```
+
+The ViT output uses the first token representation:
+
+```python
+image_features = vit_output.last_hidden_state[:, 0]
+```
+
+This produces the global image representation used by the multimodal fusion layer.
+
+---
+
+## 5.2 Text Encoder — BERT
+
+The text encoder is:
+
+```text
+bert-base-uncased
+```
+
+loaded using Hugging Face Transformers.
+
+Questions are tokenized with:
+
+```python
+AutoTokenizer.from_pretrained("bert-base-uncased")
+```
+
+The notebook uses:
+
+```text
+max_length = 32
+padding = max_length
+truncation = True
+```
+
+The first BERT token representation is used as the question representation:
+
+```python
+text_features = bert_output.last_hidden_state[:, 0]
+```
+
+---
+
+# 6. Multimodal Fusion
+
+The image and text representations are concatenated:
+
+```python
+combined_features = torch.cat(
+    [image_features, text_features],
+    dim=1
+)
+```
+
+The two encoder representations are then passed through a shared fusion network:
+
+```text
+Image representation ─────┐
+                           ├── Concatenate
+Text representation ──────┘
+                           │
+                           ▼
+                      Linear
+                    input → 768
+                           │
+                          ReLU
+                           │
+                       Dropout 0.2
+                           │
+                           ▼
+                      Linear
+                    768 → 512
+                           │
+                          ReLU
+                           │
+                       Dropout 0.2
+                           │
+                           ▼
+                    Shared 512-D
+                     representation
+```
+
+The fusion network is implemented as:
+
+```python
+self.fusion = nn.Sequential(
+    nn.Linear(self.image_dim + self.text_dim, 768),
+    nn.ReLU(),
+    nn.Dropout(0.2),
+    nn.Linear(768, 512),
+    nn.ReLU(),
+    nn.Dropout(0.2)
+)
+```
+
+Because both ViT and BERT base models produce 768-dimensional hidden representations, the concatenated representation is 1536-dimensional.
+
+Thus:
+
+```text
+ViT output : 768
+BERT output: 768
+----------------
+Combined   : 1536
+```
+
+which is projected to 512 dimensions before task prediction.
+
+---
+
+# 7. Task-Specific Prediction Heads
+
+After fusion, the common 512-dimensional representation is passed to four independent heads.
+
+```text
+                    512-D Fusion
+                         │
+       ┌─────────────────┼──────────────────┐
+       │                 │                  │
+       ▼                 ▼                  ▼
+ Presence             Comparison       Rural/Urban
+ 512 → 2              512 → 2           512 → 2
+
+                         │
+                         ▼
+                       Count
+                  512 → 256 → 1
+```
+
+This design enables the model to share multimodal features while allowing each task to learn its own prediction function.
+
+---
+
+# 8. Data Preprocessing
+
+## Image preprocessing
+
+Images are opened with PIL and converted to RGB:
+
+```python
+image = Image.open(image_path).convert("RGB")
+```
+
+They are then passed to the pretrained ViT image processor:
+
+```python
+image_inputs = image_processor(
+    images=image,
+    return_tensors="pt"
+)
+```
+
+The resulting `pixel_values` are supplied to the ViT encoder.
+
+---
+
+## Text preprocessing
+
+Questions are tokenized using BERT's tokenizer:
+
+```python
+text_inputs = tokenizer(
+    sample["question"],
+    padding="max_length",
+    truncation=True,
+    max_length=32,
+    return_tensors="pt"
+)
+```
+
+The resulting inputs are:
+
+```text
+input_ids
+attention_mask
+```
+
+---
+
+# 9. Multitask Training
+
+The model is trained jointly on the available tasks.
+
+For each batch, the training pipeline computes losses only for valid labels.
+
+The classification tasks use:
+
+```python
+CrossEntropyLoss()
+```
+
+The count task uses:
+
+```python
+MSELoss()
+```
+
+after applying `log1p` to the target count.
+
+The total loss is calculated as the mean of the available task losses:
+
+```python
+total_loss = sum(losses) / len(losses)
+```
+
+This means that missing task labels do not directly contribute a loss term for that sample.
+
+---
+
+# 10. Optimization
+
+The main training configuration used in the notebook is:
+
+| Parameter | Value |
+|---|---:|
+| Optimizer | AdamW |
+| Learning rate | 1e-5 |
+| Weight decay | 1e-4 |
+| Batch size | 4 |
+| Epochs | 5 |
+| DataLoader workers | 2 |
+| Image encoder | ViT-Base |
+| Text encoder | BERT-Base |
+| Text max length | 32 |
+| Dropout | 0.2 |
+
+The notebook uses CUDA when available.
+
+The reported training environment included:
+
+```text
+PyTorch: 2.10.0+cu128
+GPU 0: Tesla T4
+GPU 1: Tesla T4
+```
+
+The actual training device used by the final pipeline was:
+
+```text
+cuda:0
+Tesla T4
+```
+
+Mixed-precision/autocast was used during GPU training.
+
+---
+
+# 11. Checkpoint Compatibility Conversion
+
+An important part of the implementation is checkpoint conversion.
+
+The original pretrained/multitask checkpoint contained ViT parameter names that did not exactly match the current Hugging Face ViT implementation.
+
+The notebook therefore performs an explicit key conversion.
+
+Examples include:
+
+```text
+.attention.q_proj.
+        ↓
+.attention.attention.query.
+
+.attention.k_proj.
+        ↓
+.attention.attention.key.
+
+.attention.v_proj.
+        ↓
+.attention.attention.value.
+
+.attention.o_proj.
+        ↓
+.attention.output.dense.
+
+.mlp.fc1.
+        ↓
+.intermediate.dense.
+
+.mlp.fc2.
+        ↓
+.output.dense.
+```
+
+The encoder layer prefix is also converted:
+
+```text
+vit.layers.
+     ↓
+vit.encoder.layer.
+```
+
+After conversion, the notebook verifies:
+
+```text
+Original checkpoint tensors : 413
+Converted tensors           : 413
+Current model tensors       : 413
+Mapped tensors              : 413
+Unmapped tensors            : 0
+Missing model keys          : 0
+Shape mismatches            : 0
+```
+
+The converted checkpoint is therefore loaded with:
+
+```python
+strict=True
+```
+
+This prevents silently ignoring incompatible model parameters.
+
+---
+
+# 12. Training Procedure
+
+The overall training workflow is:
+
+```text
+1. Load RSVQA-LR dataset
+        ↓
+2. Load ViT + BERT pretrained encoders
+        ↓
+3. Load existing multitask checkpoint
+        ↓
+4. Convert checkpoint parameter names if required
+        ↓
+5. Verify 100% checkpoint compatibility
+        ↓
+6. Build train / validation DataLoaders
+        ↓
+7. Train multimodal multitask model
+        ↓
+8. Monitor validation loss
+        ↓
+9. Save best checkpoint
+        ↓
+10. Evaluate best checkpoint
+        ↓
+11. Perform count-focused fine-tuning
+        ↓
+12. Evaluate final count-finetuned model
+        ↓
+13. Evaluate on official test split
+```
+
+---
+
+# 13. Best Multitask Checkpoint
+
+During the five-epoch training configuration, the notebook recorded:
+
+### Epoch 1
+
+```text
+Train Loss : 0.8022
+Val Loss   : 0.7077
+
+Presence    : 92.57%
+Composition : 94.38%
+Rural/Urban : 95.00%
+
+Count MAE   : 81.80
+Count RMSE  : 470.01
+Exact       : 23.50%
+```
+
+### Epoch 2
+
+```text
+Train Loss : 0.7304
+Val Loss   : 0.7306
+
+Presence    : 92.63%
+Composition : 93.38%
+Rural/Urban : 92.00%
+
+Count MAE   : 73.07
+Count RMSE  : 476.52
+Exact       : 22.72%
+```
+
+### Epoch 3
+
+```text
+Train Loss : 0.6952
+Val Loss   : 0.6989
+
+Presence    : 92.63%
+Composition : 95.02%
+Rural/Urban : 87.00%
+
+Count MAE   : 84.96
+Count RMSE  : 542.59
+Exact       : 22.39%
+```
+
+The notebook marked the epoch-3 checkpoint as the best checkpoint based on validation loss:
+
+```text
+Validation loss: 0.6989
+```
+
+The saved checkpoint size was approximately:
+
+```text
+753.87 MB
+```
+
+---
+
+# 14. Count-Focused Fine-Tuning
+
+After selecting the best multitask checkpoint, the notebook performs a separate **count-focused fine-tuning stage**.
+
+The motivation in the notebook is to improve count prediction without substantially disturbing the learned classification representation.
+
+The procedure is:
+
+```text
+Best multitask checkpoint
+          ↓
+      Load model
+          ↓
+Filter batches to count questions
+          ↓
+Use count regression loss only
+          ↓
+Learning rate = 5e-6
+          ↓
+Fine-tune
+          ↓
+Save final count-finetuned model
+```
+
+The fine-tuning optimizer is:
+
+```python
+AdamW(
+    model.parameters(),
+    lr=5e-6,
+    weight_decay=1e-4
+)
+```
+
+The count objective remains:
+
+```python
+MSELoss(
+    predicted_log_count,
+    log1p(actual_count)
+)
+```
+
+The resulting model is saved as:
+
+```text
+best_count_finetuned_rsvqa.pt
+```
+
+The notebook reports a model size of approximately:
+
+```text
+753.88 MB
+```
+
+A compressed ZIP version was approximately:
+
+```text
+698.69 MB
+```
+
+The notebook also split the model into eight 100 MB parts for easier file handling.
+
+---
+
+# 15. Final Validation Results
+
+After count-focused fine-tuning, the notebook reports:
+
+| Task | Validation Result |
+|---|---:|
+| Presence accuracy | 92.33% |
+| Composition accuracy | 95.40% |
+| Rural/Urban accuracy | 85.00% |
+| Count MAE | 62.46 |
+| Count RMSE | 343.04 |
+| Count exact accuracy | 21.14% |
+| Count ±1 accuracy | 32.50% |
+| Count ±5 accuracy | 50.74% |
+| Count ±10 accuracy | 59.91% |
+
+The validation evaluation used:
+
+```text
+Presence samples    : 2,919
+Composition samples : 4,020
+Rural/Urban samples : 100
+Count samples       : 2,966
+```
+
+---
+
+# 16. Official Test Results
+
+The final count-finetuned model was evaluated on the official test split.
+
+The notebook reports:
+
+| Task | Test Result |
+|---|---:|
+| Presence accuracy | **90.80%** |
+| Composition accuracy | **91.95%** |
+| Rural/Urban accuracy | **88.00%** |
+| Count MAE | **63.74** |
+| Count RMSE | **265.85** |
+| Count exact accuracy | **22.09%** |
+| Count ±1 accuracy | **35.46%** |
+| Count ±5 accuracy | **53.82%** |
+| Count ±10 accuracy | **62.06%** |
+
+Test sample counts used by the evaluator:
+
+```text
+Presence    : 2,955
+Composition : 4,002
+Rural/Urban : 100
+Count       : 2,947
+```
+
+These metrics are task-specific; they should not be interpreted as a single overall accuracy because the model performs different classification and regression tasks.
+
+---
+
+# 17. Evaluation Metrics
+
+## Classification
+
+For the three classification tasks, the notebook calculates accuracy:
+
+```text
+Accuracy = Correct Predictions / Total Valid Predictions
+```
+
+The reported tasks are:
+
+- Presence accuracy
+- Composition accuracy
+- Rural/Urban accuracy
+
+---
+
+## Count regression
+
+Several complementary metrics are reported.
+
+### MAE
+
+Mean Absolute Error:
+
+```text
+MAE = mean(|prediction - target|)
+```
+
+This represents the average absolute difference between predicted and actual object counts.
+
+### RMSE
+
+Root Mean Squared Error:
+
+```text
+RMSE = sqrt(mean((prediction - target)^2))
+```
+
+RMSE gives greater weight to larger errors.
+
+### Exact accuracy
+
+The rounded prediction must exactly equal the rounded target.
+
+### ±1
+
+Prediction is considered correct when:
+
+```text
+|prediction - target| <= 1
+```
+
+### ±5
+
+```text
+|prediction - target| <= 5
+```
+
+### ±10
+
+```text
+|prediction - target| <= 10
+```
+
+These tolerance metrics are particularly useful for the count task because an exact-count requirement can be very strict for remote-sensing imagery.
+
+---
+
+# 18. Repository Structure
+
+A clean repository can be organized as:
+
+```text
+SatQuery-RSVQA/
+│
+├── README.md
+│
+├── notebooks/
+│   └── satquery_rsvqa_training.ipynb
+│
+├── src/
+│   ├── model.py
+│   ├── dataset.py
+│   ├── data_pipeline.py
+│   └── train.py
+│
+├── checkpoints/
+│   ├── best_rsvqa_multitask.pt
+│   └── best_count_finetuned_rsvqa.pt
+│
+├── scripts/
+│   ├── train.py
+│   ├── evaluate.py
+│   └── convert_checkpoint.py
+│
+├── requirements.txt
+│
+└── .gitignore
+```
+
+The large model checkpoint should normally be stored using **Git LFS** or a model/artifact hosting service rather than ordinary Git.
+
+---
+
+# 19. Recommended Files to Push
+
+The notebook references the following core implementation files:
+
+```text
+model.py
+dataset.py
+data_pipeline.py
+train.py / train_colab.py
+```
+
+You should also push:
+
+```text
+README.md
+requirements.txt
+notebooks/
+```
+
+If the repository needs the trained model, use Git LFS for:
+
+```text
+best_count_finetuned_rsvqa.pt
+```
+
+The checkpoint is approximately 754 MB and is therefore not suitable for a normal Git object.
+
+The dataset itself should generally not be committed directly to the repository. Instead, document where the dataset comes from and provide the expected directory structure.
+
+---
+
+# 20. Reproducibility
+
+The implementation depends on:
+
+- Python
+- PyTorch
+- Hugging Face Transformers
+- PIL/Pillow
+- NumPy
+- pandas
+- tqdm
+
+A representative environment used in the notebook included:
+
+```text
+PyTorch 2.10.0+cu128
+CUDA available
+Tesla T4 GPU
+```
+
+The exact versions of every package are not recorded in the notebook, so a complete `requirements.txt` should be generated from the final environment before claiming exact environment reproducibility.
+
+---
+
+# 21. Inference Concept
+
+Given a satellite image and a question:
+
+```text
+Image + Question
+       │
+       ├── Image → ViT → Image embedding
+       │
+       └── Question → BERT → Text embedding
+                         │
+                         ▼
+                 Concatenation
+                         │
+                         ▼
+                  Fusion Network
+                         │
+                         ▼
+                 512-D representation
+                         │
+          ┌──────────────┼──────────────┐
+          │              │              │
+          ▼              ▼              ▼
+      Presence       Comparison     Rural/Urban
+          │              │              │
+          └──────────────┼──────────────┘
+                         │
+                         ▼
+                       Count
+```
+
+The selected prediction head depends on the question type.
+
+---
+
+# 22. Important Implementation Details
+
+### 1. Numeric TIFF image IDs
+
+The physical images are stored as:
+
+```text
+0.tif ... 771.tif
+```
+
+The dataset wrapper uses `image_id` to locate them.
+
+### 2. BERT sequence length
+
+Questions are limited to:
+
+```text
+32 tokens
+```
+
+through padding and truncation.
+
+### 3. Log-transformed count
+
+Count regression is performed in:
+
+```text
+log(1 + count)
+```
+
+space rather than directly on raw counts.
+
+### 4. Task-specific masking
+
+Only valid labels participate in each task's loss.
+
+### 5. Checkpoint conversion
+
+The project contains explicit conversion logic for differences between the checkpoint's ViT naming scheme and the current Hugging Face ViT naming scheme.
+
+### 6. Strict checkpoint validation
+
+The final conversion verifies that all 413 model tensors are mapped with no missing or unexpected tensors before loading the checkpoint.
+
+### 7. Count-focused fine-tuning
+
+The final checkpoint is not simply the original multitask checkpoint. It is the result of starting from the selected multitask checkpoint and performing an additional count-focused fine-tuning stage.
+
+---
+
+# 23. Limitations
+
+The current implementation has several limitations that should be considered when extending the project:
+
+1. **Count prediction remains substantially harder than the classification tasks.** The test exact-count accuracy is 22.09%, although tolerance-based accuracy reaches 62.06% within ±10 objects.
+
+2. **The model uses a relatively simple fusion mechanism.** Image and text representations are concatenated and passed through an MLP rather than using cross-attention between visual tokens and language tokens.
+
+3. **The final model is large.** The checkpoint is approximately 754 MB.
+
+4. **The notebook is GPU-oriented.** The documented training run used a Tesla T4 GPU.
+
+5. **The dataset is not included in the repository.** A separate dataset acquisition/setup step is required.
+
+6. **The notebook does not record a complete pinned Python dependency environment.** Exact package-level reproducibility therefore requires capturing the final runtime environment.
+
+7. **The reported metrics are task-specific.** Classification accuracy and count regression errors should not be collapsed into a single accuracy number.
+
+---
+
+# 24. Future Improvements
+
+Possible research extensions include:
+
+### Better multimodal fusion
+
+Replace simple concatenation with:
+
+- Cross-attention
+- Multimodal Transformer layers
+- Co-attention between image patches and question tokens
+
+### Improved count prediction
+
+Investigate:
+
+- Count-specific loss functions
+- Huber loss
+- Poisson/negative-binomial objectives
+- Ordinal count prediction
+- Density-map based counting
+- Object detection assisted counting
+
+### Stronger remote-sensing encoders
+
+Experiment with remote-sensing-specific pretrained visual encoders instead of a general-purpose ImageNet-style ViT.
+
+### Question-aware visual attention
+
+Instead of using only the global ViT CLS representation, allow the question representation to attend to relevant image patches.
+
+### More robust evaluation
+
+Report:
+
+- Per-question-type performance
+- Confusion matrices
+- MAE/RMSE distributions
+- Error analysis by object category
+- Performance by count range
+- Performance on unseen question formulations
+
+---
+
+# 25. Citation and Dataset Attribution
+
+This repository uses the RSVQA-LR dataset packaged for the project. The notebook references the Kaggle resource:
+
+```text
+heenarathore123/satquery-rsvqa
+```
+
+Please preserve the original dataset's licensing and attribution requirements when redistributing or publishing the project.
+
+If this repository is used in a paper, report the exact dataset version/source and the model configuration used for the reported results.
+
+---
+
+# 26. Summary
+
+This project implements a **multimodal multitask RSVQA model** that combines:
+
+```text
+ViT
++
+BERT
++
+MLP Fusion
++
+Multiple Task Heads
+```
+
+The model receives both the satellite image and natural-language question and jointly supports:
+
+```text
+Presence classification
+Composition/comparison classification
+Rural/urban classification
+Count regression
+```
+
+The final experimental pipeline consists of:
+
+```text
+RSVQA-LR
+   ↓
+Image preprocessing with ViTImageProcessor
+   ↓
+Question tokenization with BERT tokenizer
+   ↓
+ViT image encoder
+   +
+BERT text encoder
+   ↓
+1536-D concatenated representation
+   ↓
+768 → 512 fusion network
+   ↓
+Four task-specific prediction heads
+   ↓
+Multitask training
+   ↓
+Best checkpoint selection
+   ↓
+Count-focused fine-tuning
+   ↓
+Official test evaluation
+```
+
+The final official test evaluation reported:
+
+```text
+Presence accuracy     : 90.80%
+Composition accuracy  : 91.95%
+Rural/Urban accuracy  : 88.00%
+
+Count MAE              : 63.74
+Count RMSE             : 265.85
+Count Exact            : 22.09%
+Count ±1               : 35.46%
+Count ±5               : 53.82%
+Count ±10              : 62.06%
+```
+
+This repository provides the implementation and experimental workflow for building and evaluating the SatQuery-RSVQA multimodal model.
