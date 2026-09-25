@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Datasets
+datasets/
+*.tif
+*.tiff
+*.geotiff
+
+# Temporary archives
+*.rar
+*.7z
+
+# Large model/checkpoint files
+*.ckpt
+*.bin
+
+# Ignore the CDVQA checkpoint ZIP
+best_cdvqa_model.pth.zip
+
+# Ignore Python cache and temporary files
+*.tmp

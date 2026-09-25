@@ -1,0 +1,10 @@
+{
+  "patch_size": 8,
+  "encoder_dim": 768,
+  "encoder_layers": 12,
+  "attention_heads": 16,
+  "decoder_dim": 512,
+  "decoder_layers": 1,
+  "total_channels": 14,
+  "num_patches": 225
+}
